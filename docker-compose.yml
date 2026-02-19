@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=sqlite+aiosqlite:///./transcode.db
+      - STORAGE_DIR=./storage
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - STRIPE_PRICE_ID=${STRIPE_PRICE_ID}
+      - SECRET_KEY=${SECRET_KEY}
+    volumes:
+      - ./storage:/app/storage
+      - ./transcode.db:/app/transcode.db
