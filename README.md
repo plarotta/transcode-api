@@ -116,10 +116,18 @@ pending → processing → completed
 
 ## Self-host
 
+**Local dev (uv):**
 ```bash
 git clone https://github.com/your-org/transcode-api
 cd transcode-api
 cp .env.example .env   # fill in Stripe keys + SECRET_KEY
+uv sync
+uv run uvicorn main:app --reload
+```
+
+**Docker:**
+```bash
+cp .env.example .env
 docker-compose up
 ```
 
