@@ -15,6 +15,7 @@ from database import get_db
 from middleware.auth import get_current_user
 from models.user import User
 from services.job_service import create_job, get_job, get_jobs_for_user
+from workers.job_worker import enqueue_job
 
 router = APIRouter()
 
@@ -94,6 +95,8 @@ async def submit_job(
         output_format=body.output_format,
         output_resolution=body.output_resolution,
     )
+    # Push to in-memory queue immediately — no polling delay
+    enqueue_job(job.id)
     return job
 
 

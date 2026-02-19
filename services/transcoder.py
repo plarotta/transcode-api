@@ -1,8 +1,11 @@
 """
-Core FFmpeg/ffprobe wrapper.
+FFmpeg transcoding service — optimized for maximum throughput.
 
-All FFmpeg/ffprobe invocations use asyncio.create_subprocess_exec so they
-never block the event loop.  Downloads use httpx async streaming.
+Key design decisions:
+- FFmpeg reads from source URL directly (no download-to-disk)
+- Smart remux: copy streams when codecs are already compatible (orders of magnitude faster)
+- ultrafast preset + -threads 0 for pure CPU encoding
+- Audio copy when codec is already compatible
 """
 import asyncio
 import json
@@ -11,34 +14,43 @@ import re
 import shutil
 from typing import Awaitable, Callable
 
-import httpx
-
 from config import settings
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (also enforced via -fs flag)
 
 # Match "time=HH:MM:SS.ss" in FFmpeg progress output
 _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
+
+# Codec compatibility maps for remux detection
+_MP4_MOV_MKV_VIDEO = {"h264", "hevc"}
+_MP4_MOV_MKV_AUDIO = {"aac", "mp3"}
+_WEBM_VIDEO = {"vp8", "vp9"}
+_WEBM_AUDIO = {"opus", "vorbis"}
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-async def probe_video(input_path: str) -> dict:
+
+async def probe_video(source: str) -> dict:
     """
-    Run ffprobe on *input_path* and return a metadata dict:
+    Run ffprobe on source (URL or file path).
+
+    Returns:
         {
-            "duration": float,   # seconds
-            "width":    int,
-            "height":   int,
-            "codec":    str,
-            "format":   str,
+            "duration":     float,  # seconds
+            "width":        int,
+            "height":       int,
+            "video_codec":  str,    # e.g. "h264", "hevc", "vp9"
+            "audio_codec":  str,    # e.g. "aac", "opus" — "" if no audio
+            "format":       str,    # container format name
         }
+
     Raises RuntimeError if ffprobe exits non-zero.
     Raises ValueError  if no video stream is found.
     """
@@ -48,7 +60,7 @@ async def probe_video(input_path: str) -> dict:
         "-print_format", "json",
         "-show_streams",
         "-show_format",
-        input_path,
+        source,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -61,101 +73,51 @@ async def probe_video(input_path: str) -> dict:
         )
 
     data = json.loads(stdout.decode("utf-8"))
+    streams = data.get("streams", [])
 
-    # Find first video stream
     video_stream: dict | None = None
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") == "video":
+    audio_stream: dict | None = None
+    for stream in streams:
+        if stream.get("codec_type") == "video" and video_stream is None:
             video_stream = stream
-            break
+        elif stream.get("codec_type") == "audio" and audio_stream is None:
+            audio_stream = stream
 
     if video_stream is None:
-        raise ValueError("No video stream found in file")
+        raise ValueError("No video stream found in source")
 
     fmt = data.get("format", {})
-
-    # Duration may live on the format container or the stream itself
     raw_duration = (
         fmt.get("duration")
         or video_stream.get("duration")
         or "0"
     )
-    duration = float(raw_duration or 0)
 
     return {
-        "duration": duration,
-        "width":    int(video_stream.get("width", 0)),
-        "height":   int(video_stream.get("height", 0)),
-        "codec":    video_stream.get("codec_name", "unknown"),
-        "format":   fmt.get("format_name", "unknown"),
+        "duration":    float(raw_duration or 0),
+        "width":       int(video_stream.get("width", 0)),
+        "height":      int(video_stream.get("height", 0)),
+        "video_codec": video_stream.get("codec_name", "unknown"),
+        "audio_codec": (audio_stream.get("codec_name", "") if audio_stream else ""),
+        "format":      fmt.get("format_name", "unknown"),
     }
 
 
-async def download_video(url: str, dest_path: str) -> str:
-    """
-    Download the video at *url* to *dest_path* using httpx async streaming.
-
-    Raises:
-        ValueError – content-type is clearly not a video, or the file > 2 GB.
-        httpx.HTTPStatusError – on non-2xx responses.
-
-    Returns dest_path on success.
-    """
-    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=300.0) as client:
-        async with client.stream("GET", url) as response:
-            response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "")
-            base_type = content_type.split(";")[0].strip().lower()
-
-            # Reject obviously non-video content types
-            _REJECTED = ("text/", "application/json", "application/xml", "image/")
-            if base_type and not base_type.startswith("video/") and base_type not in (
-                "application/octet-stream",
-                "binary/octet-stream",
-                "",
-            ):
-                if any(base_type.startswith(r) for r in _REJECTED):
-                    raise ValueError(
-                        f"URL does not appear to be a video "
-                        f"(content-type: {content_type!r})"
-                    )
-
-            # Reject if Content-Length already exceeds the limit
-            content_length = response.headers.get("content-length")
-            if content_length and int(content_length) > MAX_FILE_SIZE:
-                raise ValueError(
-                    f"File too large ({content_length} bytes); maximum is 2 GB"
-                )
-
-            downloaded = 0
-            with open(dest_path, "wb") as fh:
-                async for chunk in response.aiter_bytes(chunk_size=65_536):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE:
-                        raise ValueError(
-                            "Download exceeded 2 GB limit; aborting"
-                        )
-                    fh.write(chunk)
-
-    return dest_path
-
-
 async def transcode_video(
-    input_path: str,
+    source: str,
     output_path: str,
     output_format: str,
     output_resolution: str | None,
+    probe: dict | None = None,             # pass pre-fetched probe to avoid double round-trip
     progress_callback: Callable[[float], Awaitable[None]] | None = None,
 ) -> str:
     """
-    Transcode *input_path* → *output_path* using FFmpeg.
+    Transcode source (URL or local file path) → output_path using FFmpeg.
+
+    Pass `probe` (from a prior probe_video() call) to skip the internal re-probe.
 
     output_format must be one of: mp4, webm, gif, mov, mkv
-    output_resolution is optional "WIDTHxHEIGHT" string (e.g. "1280x720").
-
+    output_resolution is an optional "WIDTHxHEIGHT" string (e.g. "1280x720").
     progress_callback(percent: float) is called periodically if supplied.
 
     Raises RuntimeError (with full stderr) if FFmpeg exits non-zero.
@@ -163,54 +125,16 @@ async def transcode_video(
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    # Parse resolution
-    out_w: int | None = None
-    out_h: int | None = None
-    if output_resolution:
-        parts = output_resolution.lower().split("x")
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            out_w, out_h = int(parts[0]), int(parts[1])
+    # Use caller-supplied probe info to avoid a second network round-trip
+    if probe is None:
+        try:
+            probe = await probe_video(source)
+        except Exception:
+            probe = {}
 
-    # Probe duration up-front so we can report meaningful progress percentages
-    duration: float | None = None
-    try:
-        info = await probe_video(input_path)
-        duration = info["duration"] or None
-    except Exception:
-        pass  # progress will just not fire — that's fine
+    duration: float | None = probe.get("duration") or None
+    cmd = _build_ffmpeg_cmd(source, output_path, output_format, output_resolution, probe)
 
-    # Build the FFmpeg command
-    cmd = [settings.ffmpeg_path, "-y", "-i", input_path]
-
-    if output_format == "gif":
-        # GIF: special palette filter, no audio
-        gif_w = out_w or 480
-        vf = f"fps=10,scale={gif_w}:-1:flags=lanczos"
-        cmd += ["-vf", vf, "-loop", "0"]
-
-    else:
-        # Resolution filter (non-GIF)
-        if out_w and out_h:
-            cmd += ["-vf", f"scale={out_w}:{out_h}"]
-
-        # Codec / container settings
-        if output_format == "mp4":
-            cmd += [
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-movflags", "+faststart",
-            ]
-        elif output_format == "webm":
-            cmd += ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-c:a", "libopus"]
-        elif output_format == "mov":
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac"]
-        elif output_format == "mkv":
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac"]
-        else:
-            raise ValueError(f"Unsupported output format: {output_format!r}")
-
-    cmd.append(output_path)
-
-    # Launch FFmpeg
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -229,10 +153,7 @@ async def transcode_video(
 
 
 async def cleanup_files(*paths: str) -> None:
-    """
-    Delete files (or directory trees) at each path.
-    Errors are silently ignored.
-    """
+    """Delete files (or directory trees) at each path. Errors are silently ignored."""
     for path in paths:
         if not path:
             continue
@@ -249,13 +170,129 @@ async def cleanup_files(*paths: str) -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
+def _can_copy_streams(
+    probe_info: dict,
+    output_format: str,
+    output_resolution: str | None,
+) -> bool:
+    """
+    Returns True if we can remux (copy streams) without re-encoding.
+
+    Conditions (all must hold):
+    - No resolution change requested
+    - Video codec is compatible with the output container:
+        mp4 / mov / mkv : h264 or hevc
+        webm            : vp8 or vp9
+        gif             : never (always re-encode)
+    - Audio codec is compatible with the output container:
+        mp4 / mov / mkv : aac or mp3
+        webm            : opus or vorbis
+    """
+    if output_format == "gif":
+        return False
+
+    if output_resolution:
+        return False
+
+    video_codec = probe_info.get("video_codec", "").lower()
+    audio_codec = probe_info.get("audio_codec", "").lower()
+
+    if output_format in ("mp4", "mov", "mkv"):
+        return video_codec in _MP4_MOV_MKV_VIDEO and audio_codec in _MP4_MOV_MKV_AUDIO
+    elif output_format == "webm":
+        return video_codec in _WEBM_VIDEO and audio_codec in _WEBM_AUDIO
+
+    return False
+
+
+def _build_ffmpeg_cmd(
+    source: str,
+    output_path: str,
+    output_format: str,
+    output_resolution: str | None,
+    probe: dict,
+) -> list[str]:
+    """Build the optimal FFmpeg command list for the given parameters."""
+    cmd = [settings.ffmpeg_path, "-y"]
+
+    # For HTTP(S) sources, add reconnect options for resilience / speed
+    if source.startswith("http"):
+        cmd += [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
+
+    cmd += ["-i", source, "-threads", "0"]
+
+    can_copy = _can_copy_streams(probe, output_format, output_resolution)
+
+    if output_format == "gif":
+        # GIF always needs palette-based re-encoding; no audio stream
+        gif_w = int(output_resolution.split("x")[0]) if output_resolution else 480
+        cmd += ["-vf", f"fps=10,scale={gif_w}:-1:flags=lanczos", "-loop", "0"]
+
+    elif can_copy:
+        # Remux only — fastest path, no quality loss
+        cmd += ["-c", "copy"]
+        if output_format == "mp4":
+            cmd += ["-movflags", "+faststart"]
+
+    else:
+        # Re-encode with speed-optimised settings
+        if output_resolution:
+            w, h = output_resolution.split("x")
+            cmd += ["-vf", f"scale={w}:{h}"]
+
+        if output_format in ("mp4", "mov", "mkv"):
+            cmd += [
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-threads", "0",
+            ]
+            # Copy audio when already in a compatible codec — skip re-encoding
+            audio_codec = probe.get("audio_codec", "").lower()
+            if audio_codec in _MP4_MOV_MKV_AUDIO:
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-c:a", "aac", "-b:a", "128k"]
+            if output_format == "mp4":
+                cmd += ["-movflags", "+faststart"]
+
+        elif output_format == "webm":
+            # -deadline realtime + -cpu-used 8 is the fastest VP9 mode
+            cmd += [
+                "-c:v", "libvpx-vp9",
+                "-deadline", "realtime",
+                "-cpu-used", "8",
+                "-crf", "35",
+                "-b:v", "0",
+                "-threads", "0",
+            ]
+            audio_codec = probe.get("audio_codec", "").lower()
+            if audio_codec in _WEBM_AUDIO:
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-c:a", "libopus", "-b:a", "96k"]
+
+        else:
+            raise ValueError(f"Unsupported output format: {output_format!r}")
+
+    # Hard cap: abort if output exceeds 2 GB
+    cmd += ["-fs", "2147483648"]
+    cmd.append(output_path)
+    return cmd
+
+
 async def _monitor_stderr(
     proc: asyncio.subprocess.Process,
     duration: float | None,
     progress_callback: Callable[[float], Awaitable[None]] | None,
 ) -> str:
     """
-    Drain FFmpeg's stderr, firing *progress_callback* on each time= update.
+    Drain FFmpeg's stderr, firing progress_callback on each time= update.
     Returns the full stderr as a single string (for error messages).
 
     FFmpeg uses \\r (not \\n) for in-place progress lines, so we split on both.
@@ -268,7 +305,7 @@ async def _monitor_stderr(
         if not chunk:
             break
         buf += chunk
-        # Split on either CR or LF; keep the last (possibly incomplete) fragment
+        # Split on CR or LF; keep the last (possibly incomplete) fragment
         parts = re.split(rb"[\r\n]", buf)
         buf = parts[-1]
 

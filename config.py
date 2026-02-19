@@ -3,6 +3,11 @@ from typing import Optional
 import os
 
 
+def _default_concurrency() -> int:
+    """Use all CPU cores by default. Override via MAX_CONCURRENT_JOBS env var."""
+    return os.cpu_count() or 2
+
+
 class Settings(BaseSettings):
     app_env: str = "development"
     secret_key: str = "changeme"
@@ -17,8 +22,11 @@ class Settings(BaseSettings):
 
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
-    max_concurrent_jobs: int = 2
+    # Auto-detects CPU count; override with MAX_CONCURRENT_JOBS=N in .env
+    max_concurrent_jobs: int = _default_concurrency()
     max_video_duration_seconds: int = 3600
+    # ultrafast|superfast|veryfast|faster|fast — override with FFMPEG_PRESET=fast
+    ffmpeg_preset: str = "ultrafast"
 
     credits_per_minute: int = 10        # credits consumed per minute of video
     credit_pack_credits: int = 1000     # credits per pack
