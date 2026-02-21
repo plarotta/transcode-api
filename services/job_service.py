@@ -38,11 +38,18 @@ async def get_job(db: AsyncSession, job_id: str) -> Job | None:
     return result.scalar_one_or_none()
 
 
-async def get_jobs_for_user(db: AsyncSession, user_id: str) -> list[Job]:
+async def get_jobs_for_user(
+    db: AsyncSession,
+    user_id: str,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[Job]:
     result = await db.execute(
         select(Job)
         .where(Job.user_id == user_id)
         .order_by(Job.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     return list(result.scalars().all())
 

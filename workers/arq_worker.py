@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from arq.connections import RedisSettings
 from sqlalchemy import select
+from sqlalchemy import update as sql_update
 
 from config import settings
 from database import AsyncSessionLocal
@@ -43,7 +44,7 @@ async def process_job(ctx: dict, job_id: str) -> None:  # noqa: ARG001
             return
 
         job.status = "processing"
-        job.started_at = datetime.utcnow()
+        job.started_at = datetime.now(timezone.utc)
         await db.commit()
         await db.refresh(job)
 
@@ -65,19 +66,9 @@ async def process_job(ctx: dict, job_id: str) -> None:  # noqa: ARG001
                 f"(max {settings.max_video_duration_seconds}s)"
             )
 
-        # Step 3: check credits
+        # Step 3: compute credits needed
         duration_minutes = duration_seconds / 60.0
         credits_needed = math.ceil(duration_minutes * settings.credits_per_minute)
-
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(User).where(User.id == user_id))
-            user = result.scalar_one_or_none()
-            if not user:
-                raise RuntimeError(f"User {user_id!r} not found")
-            if user.credits < credits_needed:
-                raise ValueError(
-                    f"Insufficient credits: need {credits_needed}, have {user.credits}"
-                )
 
         # Step 4: transcode
         job_dir = os.path.join(settings.storage_dir, job_id)
@@ -92,12 +83,20 @@ async def process_job(ctx: dict, job_id: str) -> None:  # noqa: ARG001
             probe=probe,
         )
 
-        # Step 5: deduct credits + mark complete
+        # Step 5: atomically deduct credits + mark complete
         async with AsyncSessionLocal() as db:
-            result = await db.execute(select(User).where(User.id == user_id))
-            user = result.scalar_one_or_none()
-            if user:
-                user.credits = max(0, user.credits - credits_needed)
+            # Atomic credit deduction: only succeeds if credits >= credits_needed
+            result = await db.execute(
+                sql_update(User)
+                .where(User.id == user_id, User.credits >= credits_needed)
+                .values(credits=User.credits - credits_needed)
+                .returning(User.id)
+            )
+            row = result.fetchone()
+            if row is None:
+                raise ValueError(
+                    f"Insufficient credits: need {credits_needed}"
+                )
 
             result = await db.execute(select(Job).where(Job.id == job_id))
             job = result.scalar_one_or_none()
@@ -106,7 +105,7 @@ async def process_job(ctx: dict, job_id: str) -> None:  # noqa: ARG001
                 job.output_url = f"/jobs/{job_id}/download"
                 job.duration_seconds = duration_seconds
                 job.credits_charged = credits_needed
-                job.completed_at = datetime.utcnow()
+                job.completed_at = datetime.now(timezone.utc)
 
             await db.commit()
 
@@ -120,7 +119,7 @@ async def process_job(ctx: dict, job_id: str) -> None:  # noqa: ARG001
                 if job:
                     job.status = "failed"
                     job.error_message = error_msg[:2000]
-                    job.completed_at = datetime.utcnow()
+                    job.completed_at = datetime.now(timezone.utc)
                     await db.commit()
         except Exception as db_err:
             print(f"[arq] Could not write failure for {job_id}: {db_err}")

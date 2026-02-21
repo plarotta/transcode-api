@@ -25,7 +25,7 @@ SUPPORTED_FORMATS = {"mp4", "webm", "gif", "mov", "mkv"}
 # ── Schemas ────────────────────────────────────────────────────────────────────
 
 class TranscodeRequest(BaseModel):
-    input_url: str
+    input_url: HttpUrl  # rejects non-http(s) schemes automatically
     output_format: str
     output_resolution: Optional[str] = None  # e.g. "1280x720"
 
@@ -94,7 +94,7 @@ async def submit_job(
     job = await create_job(
         db,
         user_id=current_user.id,
-        input_url=body.input_url,
+        input_url=str(body.input_url),  # cast Url → str
         output_format=body.output_format,
         output_resolution=body.output_resolution,
     )
@@ -115,8 +115,7 @@ async def list_jobs(
     db: AsyncSession = Depends(get_db),
 ):
     """Return the authenticated user's jobs, newest first."""
-    jobs = await get_jobs_for_user(db, current_user.id)
-    return jobs[offset : offset + limit]
+    return await get_jobs_for_user(db, current_user.id, limit=limit, offset=offset)
 
 
 @router.get(
@@ -154,6 +153,11 @@ async def download_output(
             status_code=409,
             detail=f"Job is not completed yet (status: {job.status})",
         )
+
+    # If output_url is an external URL (R2), redirect to it
+    if job.output_url and job.output_url.startswith(("http://", "https://")):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=job.output_url)
 
     output_path = os.path.join(settings.storage_dir, job_id, f"output.{job.output_format}")
     if not os.path.exists(output_path):

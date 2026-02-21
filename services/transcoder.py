@@ -141,8 +141,24 @@ async def transcode_video(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    stderr_text = await _monitor_stderr(proc, duration, progress_callback)
-    await proc.wait()
+    try:
+        stderr_text = await _monitor_stderr(proc, duration, progress_callback)
+        await proc.wait()
+    except asyncio.CancelledError:
+        # ARQ timeout or explicit cancellation — kill the subprocess before re-raising
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass  # already gone
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        raise  # re-raise CancelledError so ARQ knows the task was cancelled
 
     if proc.returncode != 0:
         raise RuntimeError(

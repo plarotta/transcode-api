@@ -11,7 +11,7 @@ Usage in a router:
 from fastapi import Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from crud import get_user_by_api_key
+from services.user_service import get_user_by_api_key
 from database import get_db
 from models.user import User
 
