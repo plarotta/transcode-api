@@ -98,8 +98,8 @@ async def submit_job(
         output_format=body.output_format,
         output_resolution=body.output_resolution,
     )
-    # Push to in-memory queue immediately — no polling delay
-    enqueue_job(job.id)
+    # Push to Redis queue immediately via ARQ
+    await enqueue_job(job.id)
     return job
 
 
