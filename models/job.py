@@ -30,4 +30,21 @@ class Job(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Segment tracking for long-form video parallelism
+    parent_job_id: Mapped[str | None] = mapped_column(String, ForeignKey("jobs.id"), nullable=True, index=True)
+    segment_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_segments: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     user: Mapped["User"] = relationship("User", back_populates="jobs")
+
+    children: Mapped[list["Job"]] = relationship(
+        "Job",
+        back_populates="parent",
+        foreign_keys=[parent_job_id],
+    )
+    parent: Mapped["Job | None"] = relationship(
+        "Job",
+        back_populates="children",
+        remote_side=[id],
+        foreign_keys=[parent_job_id],
+    )

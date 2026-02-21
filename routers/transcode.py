@@ -43,6 +43,9 @@ class JobResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    parent_job_id: Optional[str] = None
+    segment_index: Optional[int] = None
+    total_segments: Optional[int] = None
 
     class Config:
         from_attributes = True

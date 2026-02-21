@@ -1,6 +1,7 @@
 """
 Transcoding job service layer.
 """
+import uuid
 from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +45,51 @@ async def get_jobs_for_user(db: AsyncSession, user_id: str) -> list[Job]:
         .order_by(Job.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+async def get_child_jobs(db: AsyncSession, parent_job_id: str) -> list[Job]:
+    """Return all segment jobs for a parent job, ordered by segment_index."""
+    result = await db.execute(
+        select(Job)
+        .where(Job.parent_job_id == parent_job_id)
+        .order_by(Job.segment_index)
+    )
+    return list(result.scalars().all())
+
+
+async def all_segments_complete(db: AsyncSession, parent_job_id: str) -> bool:
+    """Return True if all child jobs are in 'completed' status."""
+    children = await get_child_jobs(db, parent_job_id)
+    if not children:
+        return False
+    return all(child.status == "completed" for child in children)
+
+
+async def create_segment_job(
+    db: AsyncSession,
+    parent_job_id: str,
+    user_id: str,
+    input_url: str,
+    output_format: str,
+    output_resolution: str | None,
+    segment_index: int,
+    total_segments: int,
+) -> Job:
+    """Create a child segment job."""
+    job = Job(
+        user_id=user_id,
+        input_url=input_url,
+        output_format=output_format,
+        output_resolution=output_resolution,
+        status="pending",
+        parent_job_id=parent_job_id,
+        segment_index=segment_index,
+        total_segments=total_segments,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
 
 
 async def update_job_status(
