@@ -20,6 +20,17 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     stripe_price_id: str = ""
 
+    # Cloudflare R2 storage (S3-compatible)
+    # Set USE_R2=true in production; leave false for local dev (no creds needed)
+    use_r2: bool = False
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket: str = "transcode-outputs"
+    r2_public_url: str = ""  # optional: custom public domain for R2 bucket
+
+    redis_url: str = "redis://localhost:6379"
+
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
     # Auto-detects CPU count; override with MAX_CONCURRENT_JOBS=N in .env
